@@ -19,14 +19,14 @@
     "vite": "^7.2.4"
   },
   "dependencies": {
-    "@durable-streams/client": "workspace:^",
-    "@durable-streams/state": "workspace:^",
-    "@durable-streams/y-durable-streams": "workspace:^",
+    "@durable-streams/client": "file:../durable-streams/packages/client",
+    "@durable-streams/state": "file:../durable-streams/packages/state",
+    "@durable-streams/y-durable-streams": "file:../durable-streams/packages/y-durable-streams",
     "@tanstack/react-db": "latest",
-    "lib0": "^0.2.99",
+    "lib0": "^0.2.117",
     "react": "^19.2.1",
     "react-dom": "^19.2.1",
-    "y-protocols": "^1.0.6",
-    "yjs": "^13.6.24"
+    "y-protocols": "^1.0.7",
+    "yjs": "^13.6.30"
   }
 }

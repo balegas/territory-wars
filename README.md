@@ -4,17 +4,27 @@ Multiplayer territory game built with [Yjs](https://yjs.dev) CRDTs on [Durable S
 
 Built with React, TypeScript, and [Electric Cloud](https://electric-sql.com/cloud).
 
+## Prerequisites
+
+This project depends on the `@durable-streams` packages. Clone the [durable-streams](https://github.com/durable-streams/durable-streams) repo as a sibling directory:
+
+```
+parent/
+├── durable-streams/   # git clone https://github.com/durable-streams/durable-streams
+└── territory-wars/    # this repo
+```
+
 ## Setup
 
-1. Sign up at [Electric Cloud](https://dashboard.electric-sql.com)
-2. Create a **Yjs** service and a **Durable Streams** service
-3. Copy `.env.example` to `.env` and fill in your service URLs and tokens:
+1. Copy `.env.example` to `.env`:
 
 ```sh
 cp .env.example .env
 ```
 
-4. Install and run:
+The `.env.example` ships with pre-configured Electric Cloud service URLs and tokens. Edit them if you want to use your own services (sign up at [Electric Cloud](https://dashboard.electric-sql.com)).
+
+2. Install and run:
 
 ```sh
 npm install
