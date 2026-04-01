@@ -2,34 +2,32 @@ import * as Y from "yjs"
 import { Awareness } from "y-protocols/awareness"
 import { YjsProvider } from "@durable-streams/y-durable-streams"
 import {
-  parseRoomConfig,
-  getCellsMap,
-  getPlayersMap,
-  readPlayers,
-  readCells,
-  readAllPlayers,
-  findEnclosedCells,
-  initGameTimer,
-  getGameStartedAt,
-  getGameEndedAt,
-  setGameEnded,
-  findWinner,
-  findLeaderByScore,
-  hashName,
-  getColor,
-  MOVE_INTERVAL,
-  STUN_DURATION,
   GAME_DURATION_MS,
+  MOVE_INTERVAL,
+  executeMove,
+  findLeaderByScore,
+  findWinner,
+  getCellsMap,
+  getGameEndedAt,
+  getGameStartedAt,
+  getPlayersMap,
+  initGameTimer,
+  parseRoomConfig,
+  readAllPlayers,
+  readCells,
+  readPlayers,
+  setGameEnded,
 } from "../utils/game-logic"
 import { nextStep } from "./pathfinder"
-import { HaikuClient, buildBoardSummary } from "./haiku-client"
+import { buildBoardSummary } from "./haiku-client"
+import type { HaikuClient } from "./haiku-client"
 
 const STRATEGY_INTERVAL = 3000
 
 export class AIPlayer {
   readonly playerId: string
   readonly playerName: string
-  readonly playerColor: string
+  playerColor: string
 
   private doc: Y.Doc
   private awareness: Awareness
@@ -44,21 +42,28 @@ export class AIPlayer {
   private strategyTimer: ReturnType<typeof setInterval> | null = null
   private timerCheckTimer: ReturnType<typeof setInterval> | null = null
   private destroyed = false
+  private gameWasOver = false
 
   private cols: number
   private rows: number
   private haiku: HaikuClient
+  private onNoHumans: (() => void) | null = null
+  private hadHumans = false
+  private noHumansTimer: ReturnType<typeof setTimeout> | null = null
 
   constructor(
     name: string,
     roomId: string,
     yjsBaseUrl: string,
     yjsHeaders: Record<string, string>,
-    haikuClient: HaikuClient
+    haikuClient: HaikuClient,
+    color: string,
+    onNoHumans?: () => void
   ) {
-    this.playerName = `Bot-${name}`
+    this.onNoHumans = onNoHumans ?? null
+    this.playerName = `Haiku-${name}`
     this.playerId = `bot-${name.toLowerCase()}-${Math.random().toString(36).slice(2, 8)}`
-    this.playerColor = getColor(hashName(this.playerName))
+    this.playerColor = color
     this.haiku = haikuClient
 
     const config = parseRoomConfig(roomId)
@@ -70,6 +75,7 @@ export class AIPlayer {
     this.awareness.setLocalState({
       user: { name: this.playerName, color: this.playerColor },
       playerId: this.playerId,
+      type: `bot`,
     })
 
     this.provider = new YjsProvider({
@@ -90,7 +96,12 @@ export class AIPlayer {
     this.provider.connect()
   }
 
+  private started = false
+
   private onSynced(): void {
+    if (this.started) return
+    this.started = true
+
     // Pick a start position spread across the board
     this.x = Math.floor(Math.random() * this.cols)
     this.y = Math.floor(Math.random() * this.rows)
@@ -125,12 +136,41 @@ export class AIPlayer {
     // Check timer expiry
     this.timerCheckTimer = setInterval(() => this.checkTimerExpiry(), 1000)
 
+    // Monitor awareness for human players leaving
+    this.awareness.on(`change`, () => this.checkHumansPresent())
+
     // Do an initial strategy call
     void this.updateStrategy()
 
-    console.log(
-      `[${this.playerName}] joined at (${this.x}, ${this.y})`
-    )
+    console.log(`[${this.playerName}] joined at (${this.x}, ${this.y})`)
+  }
+
+  private checkHumansPresent(): void {
+    if (this.destroyed) return
+
+    let humanCount = 0
+    this.awareness.getStates().forEach((state, clientId) => {
+      if (clientId === this.awareness.clientID) return
+      if (state.type === `human`) humanCount++
+    })
+
+    if (humanCount > 0) {
+      this.hadHumans = true
+      // Cancel any pending shutdown — humans are still here
+      if (this.noHumansTimer) {
+        clearTimeout(this.noHumansTimer)
+        this.noHumansTimer = null
+      }
+    } else if (this.hadHumans && humanCount === 0 && !this.noHumansTimer) {
+      // Debounce: wait 5s before concluding humans are gone
+      this.noHumansTimer = setTimeout(() => {
+        if (this.destroyed) return
+        console.log(
+          `[${this.playerName}] All humans left the room — triggering shutdown`
+        )
+        this.onNoHumans?.()
+      }, 5000)
+    }
   }
 
   private checkTimerExpiry(): void {
@@ -163,13 +203,47 @@ export class AIPlayer {
     }
   }
 
+  private resetForRematch(): void {
+    console.log(`[${this.playerName}] Rematch detected — resetting`)
+    this.gameWasOver = false
+    this.stunnedUntil = 0
+    this.target = null
+
+    // Pick a new random starting position
+    this.x = Math.floor(Math.random() * this.cols)
+    this.y = Math.floor(Math.random() * this.rows)
+
+    // Re-register in players map and claim starting cell
+    const playersMap = getPlayersMap(this.doc)
+    playersMap.set(this.playerId, {
+      x: this.x,
+      y: this.y,
+      name: this.playerName,
+      color: this.playerColor,
+    })
+    const cellsMap = getCellsMap(this.doc)
+    this.doc.transact(() => {
+      cellsMap.set(`${this.x},${this.y}`, {
+        owner: this.playerId,
+        claimedAt: Date.now(),
+      })
+    })
+
+    initGameTimer(this.doc)
+    void this.updateStrategy()
+  }
+
   private doMove(): void {
     if (this.destroyed) return
-    if (getGameEndedAt(this.doc) !== null) return
-
-    const now = Date.now()
-    if (this.stunnedUntil && now < this.stunnedUntil) return
-
+    const gameEnded = getGameEndedAt(this.doc) !== null
+    if (gameEnded) {
+      this.gameWasOver = true
+      return
+    }
+    if (this.gameWasOver) {
+      this.resetForRematch()
+      return
+    }
     if (!this.target) return
 
     const others = readPlayers(this.doc, this.playerId)
@@ -181,97 +255,48 @@ export class AIPlayer {
       this.rows
     )
 
-    if (dir.dx === 0 && dir.dy === 0) return
-
-    const nx = Math.max(0, Math.min(this.cols - 1, this.x + dir.dx))
-    const ny = Math.max(0, Math.min(this.rows - 1, this.y + dir.dy))
-    if (nx === this.x && ny === this.y) return
-
-    // Check collision
-    const collidedWith = Array.from(others.entries()).find(
-      ([, p]) => p.x === nx && p.y === ny
-    )
-
-    if (collidedWith) {
-      const [otherId, otherPlayer] = collidedWith
-      const stunUntil = now + STUN_DURATION
-      this.stunnedUntil = stunUntil
-
-      const playersMap = getPlayersMap(this.doc)
-      playersMap.set(otherId, { ...otherPlayer, stunnedUntil: stunUntil })
-      playersMap.set(this.playerId, {
-        x: this.x,
-        y: this.y,
-        name: this.playerName,
-        color: this.playerColor,
-        stunnedUntil: stunUntil,
-      })
+    if (dir.dx === 0 && dir.dy === 0) {
+      // Reached target — pick a random nearby target to keep moving
+      this.target = {
+        x: Math.max(0, Math.min(this.cols - 1, this.x + Math.floor(Math.random() * 11) - 5)),
+        y: Math.max(0, Math.min(this.rows - 1, this.y + Math.floor(Math.random() * 11) - 5)),
+      }
       return
     }
 
-    this.x = nx
-    this.y = ny
-
-    // Update awareness
-    this.awareness.setLocalState({
-      ...this.awareness.getLocalState(),
-      x: nx,
-      y: ny,
-    })
-
-    // Update players map
-    const playersMap = getPlayersMap(this.doc)
-    playersMap.set(this.playerId, {
-      x: nx,
-      y: ny,
-      name: this.playerName,
-      color: this.playerColor,
-    })
-
-    // Claim cell
-    const cellsMap = getCellsMap(this.doc)
-    const claimTime = Date.now()
-    this.doc.transact(() => {
-      cellsMap.set(`${nx},${ny}`, {
-        owner: this.playerId,
-        claimedAt: claimTime,
-      })
-    })
-
-    // Check enclosure
-    const activePlayers = new Set<string>([this.playerId])
-    readPlayers(this.doc, this.playerId).forEach((_, id) =>
-      activePlayers.add(id)
-    )
-    const enclosed = findEnclosedCells(
+    const result = executeMove(
+      this.doc,
       this.playerId,
-      cellsMap,
+      this.playerName,
+      this.playerColor,
+      { x: this.x, y: this.y },
+      dir,
       this.cols,
       this.rows,
-      activePlayers
+      this.stunnedUntil
     )
-    if (enclosed.length > 0) {
-      this.doc.transact(() => {
-        for (const cell of enclosed) {
-          cellsMap.set(`${cell.x},${cell.y}`, {
-            owner: this.playerId,
-            claimedAt: claimTime,
-          })
-        }
+
+    this.stunnedUntil = result.stunnedUntil
+    if (result.moved) {
+      this.x = result.x
+      this.y = result.y
+
+      this.awareness.setLocalState({
+        ...this.awareness.getLocalState(),
+        x: result.x,
+        y: result.y,
       })
-      console.log(
-        `[${this.playerName}] Enclosed ${enclosed.length} cells!`
-      )
     }
 
     // Check win condition
     if (getGameEndedAt(this.doc) === null) {
       const cells = readCells(this.doc)
       const totalCells = this.cols * this.rows
-      const result = findWinner(cells, totalCells, playersMap)
-      if (result) {
+      const playersMap = getPlayersMap(this.doc)
+      const winner = findWinner(cells, totalCells, playersMap)
+      if (winner) {
         console.log(
-          `[${this.playerName}] ${result.name} wins with ${result.pct}%!`
+          `[${this.playerName}] ${winner.name} wins with ${winner.pct}%!`
         )
         setGameEnded(this.doc)
       }
@@ -324,6 +349,7 @@ export class AIPlayer {
     if (this.moveTimer) clearInterval(this.moveTimer)
     if (this.strategyTimer) clearInterval(this.strategyTimer)
     if (this.timerCheckTimer) clearInterval(this.timerCheckTimer)
+    if (this.noHumansTimer) clearTimeout(this.noHumansTimer)
 
     // Remove from players map
     try {

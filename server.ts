@@ -1,4 +1,3 @@
-import "dotenv/config"
 import { AgentServer } from "./src/agent/agent-server"
 
 function required(name: string): string {
@@ -32,8 +31,10 @@ server.start().catch((err) => {
 // Graceful shutdown
 process.on(`SIGINT`, () => {
   console.log(`\n[AgentServer] Shutting down...`)
-  server.stop().then(() => process.exit(0))
+  server.stop()
+  process.exit(0)
 })
 process.on(`SIGTERM`, () => {
-  server.stop().then(() => process.exit(0))
+  server.stop()
+  process.exit(0)
 })

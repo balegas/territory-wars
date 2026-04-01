@@ -21,39 +21,50 @@ export interface TerritoryPlayer {
 // Constants
 // ============================================================================
 
-export const DEFAULT_COLS = 512
-export const DEFAULT_ROWS = 512
+export const DEFAULT_COLS = 64
+export const DEFAULT_ROWS = 64
 export const MOVE_INTERVAL = 120
 export const STUN_DURATION = 1500
-export const WIN_THRESHOLD = 0.2
+export const WIN_THRESHOLD = 0.3
 export const GAME_DURATION_MS = 120_000 // 2 minutes
 
+export const HUMAN_PLAYER_COLOR = `#d0bcff`
+
 export const PLAYER_COLORS = [
-  `#00E5FF`,
-  `#FF3D71`,
-  `#6eeb83`,
-  `#ffbc42`,
-  `#ee6352`,
-  `#9ac2c9`,
-  `#8acb88`,
-  `#1be7ff`,
-  `#C77DFF`,
-  `#72EFDD`,
-  `#F72585`,
-  `#4ECDC4`,
+  `#FF0055`,
+  `#00FF88`,
+  `#FFEE00`,
+  `#00CCFF`,
+  `#FF6600`,
+  `#00FFCC`,
+  `#FF2299`,
+  `#33FF00`,
+  `#FF00AA`,
+  `#00AAFF`,
+  `#FFAA00`,
+  `#CC00FF`,
+  `#00FF55`,
+  `#FF4400`,
+  `#0066FF`,
 ]
 
 export const BOT_NAMES = [
-  `Alpha`,
-  `Bravo`,
-  `Charlie`,
-  `Delta`,
-  `Echo`,
-  `Foxtrot`,
-  `Golf`,
-  `Hotel`,
-  `India`,
-  `Juliet`,
+  `Blaze`,
+  `Viper`,
+  `Nova`,
+  `Storm`,
+  `Fang`,
+  `Rogue`,
+  `Pulse`,
+  `Neon`,
+  `Drift`,
+  `Apex`,
+  `Phantom`,
+  `Bolt`,
+  `Cipher`,
+  `Havoc`,
+  `Spark`,
+  `Turbo`,
 ]
 
 // ============================================================================
@@ -86,9 +97,7 @@ export function getPlayersMap(doc: Y.Doc): Y.Map<TerritoryPlayer> {
   return doc.getMap(`players`)
 }
 
-export function getGameStateMap(
-  doc: Y.Doc
-): Y.Map<number | null> {
+export function getGameStateMap(doc: Y.Doc): Y.Map<number | null> {
   return doc.getMap(`gameState`)
 }
 
@@ -106,9 +115,7 @@ export function readPlayers(
   return result
 }
 
-export function readAllPlayers(
-  doc: Y.Doc
-): Map<string, TerritoryPlayer> {
+export function readAllPlayers(doc: Y.Doc): Map<string, TerritoryPlayer> {
   const playersMap = getPlayersMap(doc)
   const result = new Map<string, TerritoryPlayer>()
   playersMap.forEach((val, key) => {
@@ -211,6 +218,131 @@ export function findEnclosedCells(
 }
 
 // ============================================================================
+// Movement validation
+// ============================================================================
+
+/** Returns true if newPos is exactly one step (cardinal) from oldPos */
+export function isAdjacentMove(
+  oldPos: { x: number; y: number },
+  newPos: { x: number; y: number }
+): boolean {
+  const dx = Math.abs(newPos.x - oldPos.x)
+  const dy = Math.abs(newPos.y - oldPos.y)
+  return (dx === 1 && dy === 0) || (dx === 0 && dy === 1)
+}
+
+export interface MoveResult {
+  moved: boolean
+  stunned: boolean
+}
+
+/**
+ * Validated move: enforces adjacent-only movement, collision detection,
+ * cell claiming, and enclosure fill. Used by both browser and server.
+ */
+export function executeMove(
+  doc: Y.Doc,
+  playerId: string,
+  playerName: string,
+  playerColor: string,
+  currentPos: { x: number; y: number },
+  dir: { dx: number; dy: number },
+  cols: number,
+  rows: number,
+  stunnedUntil: number
+): MoveResult & { x: number; y: number; stunnedUntil: number } {
+  const now = Date.now()
+
+  if (stunnedUntil && now < stunnedUntil) {
+    return { moved: false, stunned: true, ...currentPos, stunnedUntil }
+  }
+
+  // Enforce direction magnitude
+  const clampedDx = Math.max(-1, Math.min(1, Math.round(dir.dx)))
+  const clampedDy = Math.max(-1, Math.min(1, Math.round(dir.dy)))
+  if (clampedDx === 0 && clampedDy === 0) {
+    return { moved: false, stunned: false, ...currentPos, stunnedUntil }
+  }
+
+  const nx = Math.max(0, Math.min(cols - 1, currentPos.x + clampedDx))
+  const ny = Math.max(0, Math.min(rows - 1, currentPos.y + clampedDy))
+
+  // Reject if not actually adjacent (e.g. clamped at boundary)
+  if (nx === currentPos.x && ny === currentPos.y) {
+    return { moved: false, stunned: false, ...currentPos, stunnedUntil }
+  }
+  if (!isAdjacentMove(currentPos, { x: nx, y: ny })) {
+    return { moved: false, stunned: false, ...currentPos, stunnedUntil }
+  }
+
+  // Collision check
+  const others = readPlayers(doc, playerId)
+  const collidedWith = Array.from(others.entries()).find(
+    ([, p]) => p.x === nx && p.y === ny
+  )
+
+  if (collidedWith) {
+    const [otherId, otherPlayer] = collidedWith
+    const stunUntil = now + STUN_DURATION
+    const playersMap = getPlayersMap(doc)
+    playersMap.set(otherId, { ...otherPlayer, stunnedUntil: stunUntil })
+    playersMap.set(playerId, {
+      x: currentPos.x,
+      y: currentPos.y,
+      name: playerName,
+      color: playerColor,
+      stunnedUntil: stunUntil,
+    })
+    return {
+      moved: false,
+      stunned: true,
+      x: currentPos.x,
+      y: currentPos.y,
+      stunnedUntil: stunUntil,
+    }
+  }
+
+  // Move is valid — update position
+  const playersMap = getPlayersMap(doc)
+  playersMap.set(playerId, {
+    x: nx,
+    y: ny,
+    name: playerName,
+    color: playerColor,
+  })
+
+  // Claim cell
+  const cellsMap = getCellsMap(doc)
+  const claimTime = Date.now()
+  doc.transact(() => {
+    cellsMap.set(`${nx},${ny}`, { owner: playerId, claimedAt: claimTime })
+  })
+
+  // Check enclosure
+  const activePlayers = new Set<string>([playerId])
+  readPlayers(doc, playerId).forEach((_, id) => activePlayers.add(id))
+  const enclosed = findEnclosedCells(
+    playerId,
+    cellsMap,
+    cols,
+    rows,
+    activePlayers
+  )
+  if (enclosed.length > 0) {
+    doc.transact(() => {
+      for (const cell of enclosed) {
+        cellsMap.set(`${cell.x},${cell.y}`, {
+          owner: playerId,
+          claimedAt: claimTime,
+        })
+      }
+    })
+  }
+
+  return { moved: true, stunned: false, x: nx, y: ny, stunnedUntil: 0 }
+}
+
+// ============================================================================
 // Color helper
 // ============================================================================
 
@@ -224,6 +356,27 @@ export function hashName(name: string): number {
 
 export function getColor(index: number): string {
   return PLAYER_COLORS[index % PLAYER_COLORS.length]
+}
+
+/**
+ * Pick the first color from PLAYER_COLORS not already used by existing players.
+ * Falls back to hashName-based color if all colors are taken.
+ */
+export function pickUniqueColor(playerName: string, doc: Y.Doc): string {
+  const playersMap = getPlayersMap(doc)
+  const usedColors = new Set<string>()
+  playersMap.forEach((p) => {
+    usedColors.add(p.color)
+  })
+
+  for (const color of PLAYER_COLORS) {
+    if (!usedColors.has(color)) {
+      return color
+    }
+  }
+
+  // All colors taken — fall back to hash
+  return getColor(hashName(playerName))
 }
 
 // ============================================================================
@@ -243,12 +396,14 @@ export function initGameTimer(doc: Y.Doc): void {
 
 export function getGameStartedAt(doc: Y.Doc): number | null {
   const gameState = getGameStateMap(doc)
-  return (gameState.get(`gameStartedAt`) as number) ?? null
+  const val = gameState.get(`gameStartedAt`)
+  return val !== undefined ? (val as number) : null
 }
 
 export function getGameEndedAt(doc: Y.Doc): number | null {
   const gameState = getGameStateMap(doc)
-  return (gameState.get(`gameEndedAt`) as number) ?? null
+  const val = gameState.get(`gameEndedAt`)
+  return val !== undefined ? (val as number) : null
 }
 
 export function setGameEnded(doc: Y.Doc): void {
@@ -283,7 +438,10 @@ export function findWinner(
     if (count >= threshold) {
       const ownerData = playersMap.get(ownerId)
       if (ownerData) {
-        return { name: ownerData.name, pct: Math.round((count / totalCells) * 100) }
+        return {
+          name: ownerData.name,
+          pct: Math.round((count / totalCells) * 100),
+        }
       }
     }
   }
@@ -307,5 +465,8 @@ export function findLeaderByScore(
   if (!leaderId || maxCells === 0) return null
   const ownerData = playersMap.get(leaderId)
   if (!ownerData) return null
-  return { name: ownerData.name, pct: Math.round((maxCells / totalCells) * 100) }
+  return {
+    name: ownerData.name,
+    pct: Math.round((maxCells / totalCells) * 100),
+  }
 }

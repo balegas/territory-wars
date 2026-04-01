@@ -1,33 +1,44 @@
 import { DurableStream } from "@durable-streams/client"
-import { createStreamDB } from "@durable-streams/state"
-import {
-  REGISTRY_TTL_SECONDS,
-  registryStateSchema,
-} from "../utils/schemas"
-import { BOT_NAMES } from "../utils/game-logic"
+import { REGISTRY_TTL_SECONDS } from "../utils/schemas"
+import { BOT_NAMES, PLAYER_COLORS } from "../utils/game-logic"
 import { AIPlayer } from "./ai-player"
 import { HaikuClient } from "./haiku-client"
 import type { RoomMetadata } from "../utils/schemas"
 
-const POLL_INTERVAL = 5_000
-const EXPIRY_CHECK_INTERVAL = 30_000
-const NUM_BOTS = 10
+const NUM_BOTS = 4
 
 interface RoomEntry {
   roomId: string
-  players: AIPlayer[]
+  players: Array<AIPlayer>
+}
+
+interface StreamEvent {
+  type: string
+  key: string
+  value?: RoomMetadata
+  headers: Record<string, string>
 }
 
 export class AgentServer {
-  private rooms = new Map<string, RoomEntry>()
+  /** Currently active rooms with live bot players */
+  private activeRooms = new Map<string, RoomEntry>()
+
+  /** Materialized room state from the stream */
+  private rooms = new Map<string, RoomMetadata>()
+
+  /** All room IDs known at startup — never join these */
+  private startupRoomIds = new Set<string>()
+
+  /** Whether initial stream load is done */
+  private initialized = false
+
   private haikuClient: HaikuClient
   private yjsBaseUrl: string
   private yjsHeaders: Record<string, string>
   private dsUrl: string
   private dsHeaders: Record<string, string>
-  private pollTimer: ReturnType<typeof setInterval> | null = null
+  private abortController: AbortController | null = null
   private expiryTimer: ReturnType<typeof setInterval> | null = null
-  private db: Awaited<ReturnType<typeof createStreamDB>> | null = null
 
   constructor(config: {
     yjsBaseUrl: string
@@ -64,136 +75,153 @@ export class AgentServer {
       })
     }
 
-    // Create StreamDB and preload
-    this.db = await createStreamDB({
-      streamOptions: {
-        url: registryUrl,
-        headers: this.dsHeaders,
-        contentType: `application/json`,
-      },
-      state: registryStateSchema,
-      actions: ({ db, stream }) => ({
-        addRoom: {
-          onMutate: (metadata: RoomMetadata) => {
-            db.collections.rooms.insert(metadata)
-          },
-          mutationFn: async (metadata: RoomMetadata) => {
-            const txid = crypto.randomUUID()
-            await stream.append(
-              JSON.stringify(
-                registryStateSchema.rooms.insert({
-                  value: metadata,
-                  headers: { txid },
-                })
-              )
-            )
-            await db.utils.awaitTxId(txid)
-          },
-        },
-        deleteRoom: {
-          onMutate: (roomId: string) => {
-            db.collections.rooms.delete(roomId)
-          },
-          mutationFn: async (roomId: string) => {
-            const txid = crypto.randomUUID()
-            await stream.append(
-              JSON.stringify(
-                registryStateSchema.rooms.delete({
-                  key: roomId,
-                  headers: { txid },
-                })
-              )
-            )
-            await db.utils.awaitTxId(txid)
-          },
-        },
-      }),
+    // Subscribe to raw stream — no TanStack DB needed
+    this.abortController = new AbortController()
+    const streamResponse = await registryStream.stream<StreamEvent>({
+      live: true,
+      signal: this.abortController.signal,
     })
-    await this.db.preload()
 
-    console.log(`[AgentServer] Registry loaded, watching for rooms...`)
+    // Process stream events
+    streamResponse.subscribeJson((batch) => {
+      for (const event of batch.items) {
+        this.handleStreamEvent(event)
+      }
 
-    // Initial sync
-    this.syncRooms()
+      // After first up-to-date, mark initialized
+      if (batch.upToDate && !this.initialized) {
+        this.initialized = true
+        // All rooms seen so far are pre-existing
+        for (const roomId of this.rooms.keys()) {
+          this.startupRoomIds.add(roomId)
+        }
+        console.log(
+          `[AgentServer] Ready. ${this.startupRoomIds.size} existing rooms skipped. Watching for new rooms...`
+        )
+      }
 
-    // Poll for room changes
-    this.pollTimer = setInterval(() => {
-      this.syncRooms()
-    }, POLL_INTERVAL)
+      return Promise.resolve()
+    })
 
-    // Periodically check for expired rooms
+    // Wait for initial sync
+    await new Promise<void>((resolve) => {
+      const check = setInterval(() => {
+        if (this.initialized) {
+          clearInterval(check)
+          resolve()
+        }
+      }, 100)
+    })
+
+    // Periodic expiry cleanup
     this.expiryTimer = setInterval(() => {
-      this.syncRooms()
-    }, EXPIRY_CHECK_INTERVAL)
+      this.cleanupExpiredRooms()
+    }, 30_000)
   }
 
-  private getActiveRooms(): RoomMetadata[] {
-    if (!this.db) return []
+  private handleStreamEvent(event: StreamEvent): void {
+    // The rooms collection uses type="stream" per the schema definition
+    if (event.type !== `stream`) return
 
-    const now = Date.now()
-    const allRooms = this.db.collections.rooms.toArray as unknown as RoomMetadata[]
-    return allRooms.filter((r) => r.expiresAt > now)
-  }
+    const operation = event.headers.operation
+    const roomId = event.key
 
-  private syncRooms(): void {
-    const activeRooms = this.getActiveRooms()
+    if (
+      operation === `insert` ||
+      operation === `upsert` ||
+      operation === `update`
+    ) {
+      const room = event.value
+      if (!room) return
 
-    // Spawn bots for new rooms
-    for (const room of activeRooms) {
-      if (!this.rooms.has(room.roomId)) {
-        this.spawnBotsForRoom(room.roomId)
+      // Ensure roomId is set
+      const metadata: RoomMetadata = { ...room, roomId }
+
+      const isNew = !this.rooms.has(roomId)
+      this.rooms.set(roomId, metadata)
+
+      if (this.initialized && !this.startupRoomIds.has(roomId)) {
+        const now = Date.now()
+        if (metadata.expiresAt > now && !this.activeRooms.has(roomId)) {
+          console.log(
+            `[AgentServer] ${isNew ? `New room` : `Player rejoined room`}: ${roomId}`
+          )
+          this.spawnBotsForRoom(roomId)
+        } else if (isNew && metadata.expiresAt <= now) {
+          console.log(`[AgentServer] New room already expired: ${roomId}`)
+        }
+      }
+    } else if (operation === `delete`) {
+      this.rooms.delete(roomId)
+      if (this.activeRooms.has(roomId)) {
+        console.log(`[AgentServer] Room deleted: ${roomId}`)
+        this.destroyBotsForRoom(roomId)
       }
     }
+  }
 
-    // Clean up rooms that no longer exist
-    const activeRoomIds = new Set(activeRooms.map((r) => r.roomId))
-    for (const [roomId] of this.rooms) {
-      if (!activeRoomIds.has(roomId)) {
+  private cleanupExpiredRooms(): void {
+    const now = Date.now()
+    for (const [roomId, room] of this.rooms) {
+      if (room.expiresAt <= now && this.activeRooms.has(roomId)) {
+        console.log(`[AgentServer] Room expired: ${roomId}`)
         this.destroyBotsForRoom(roomId)
       }
     }
   }
 
   private spawnBotsForRoom(roomId: string): void {
-    console.log(`[AgentServer] Spawning ${NUM_BOTS} bots for room: ${roomId}`)
+    if (this.activeRooms.has(roomId)) {
+      console.log(`[AgentServer] Bots already active for ${roomId}, skipping`)
+      return
+    }
 
-    const players: AIPlayer[] = []
+    console.log(`[AgentServer] Spawning ${NUM_BOTS} bot(s) for: ${roomId}`)
+
+    // Only the first bot monitors for humans leaving — one callback is enough
+    const onNoHumans = () => {
+      console.log(
+        `[AgentServer] All humans left room ${roomId} — destroying bots`
+      )
+      this.destroyBotsForRoom(roomId)
+    }
+
+    const players: Array<AIPlayer> = []
     for (let i = 0; i < NUM_BOTS; i++) {
       const name = BOT_NAMES[i]
+      const color = PLAYER_COLORS[PLAYER_COLORS.length - 1 - i]
       const player = new AIPlayer(
         name,
         roomId,
         this.yjsBaseUrl,
         this.yjsHeaders,
-        this.haikuClient
+        this.haikuClient,
+        color,
+        i === 0 ? onNoHumans : undefined
       )
       players.push(player)
     }
 
-    this.rooms.set(roomId, { roomId, players })
+    this.activeRooms.set(roomId, { roomId, players })
   }
 
   private destroyBotsForRoom(roomId: string): void {
-    const entry = this.rooms.get(roomId)
+    const entry = this.activeRooms.get(roomId)
     if (!entry) return
 
-    console.log(`[AgentServer] Destroying bots for room: ${roomId}`)
+    console.log(`[AgentServer] Destroying bots for: ${roomId}`)
     for (const player of entry.players) {
       player.destroy()
     }
-    this.rooms.delete(roomId)
+    this.activeRooms.delete(roomId)
   }
 
-  async stop(): Promise<void> {
-    if (this.pollTimer) clearInterval(this.pollTimer)
+  stop(): void {
     if (this.expiryTimer) clearInterval(this.expiryTimer)
+    if (this.abortController) this.abortController.abort()
 
-    for (const [roomId] of this.rooms) {
+    for (const [roomId] of this.activeRooms) {
       this.destroyBotsForRoom(roomId)
-    }
-
-    if (this.db) {
-      this.db.close()
     }
 
     console.log(`[AgentServer] Stopped`)

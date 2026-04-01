@@ -3,14 +3,13 @@ import * as Y from "yjs"
 import { Awareness } from "y-protocols/awareness"
 import { YjsProvider } from "@durable-streams/y-durable-streams"
 import { ROOM_TTL_RENEWAL_MS, ROOM_TTL_SECONDS } from "../utils/schemas"
+import { HUMAN_PLAYER_COLOR } from "../utils/game-logic"
 import { GameRoomContext } from "./game-room-context"
 import { ScoresProvider } from "./scores-context"
 import { useRegistryContext } from "./registry-context"
 import { TerritoryGame } from "./TerritoryGame"
 import type { YjsProviderStatus } from "@durable-streams/y-durable-streams"
 import type { GameRoomContextValue } from "./game-room-context"
-
-import { hashName, getColor } from "../utils/game-logic"
 
 // ============================================================================
 // GameRoom component
@@ -33,20 +32,16 @@ export function GameRoom({
 }: GameRoomProps) {
   const { registryDB } = useRegistryContext()
 
-  const [{ playerId, playerColor }] = useState(() => {
+  const [{ playerId, playerColor, doc, awareness }] = useState(() => {
     const id = `player-${Math.random().toString(36).slice(2, 10)}`
-    const colorIdx = hashName(playerName)
-    return { playerId: id, playerColor: getColor(colorIdx) }
-  })
-
-  const [{ doc, awareness }] = useState(() => {
     const d = new Y.Doc()
     const a = new Awareness(d)
     a.setLocalState({
-      user: { name: playerName, color: playerColor },
-      playerId,
+      user: { name: playerName, color: HUMAN_PLAYER_COLOR },
+      playerId: id,
+      type: `human`,
     })
-    return { doc: d, awareness: a }
+    return { playerId: id, playerColor: HUMAN_PLAYER_COLOR, doc: d, awareness: a }
   })
 
   const [isLoading, setIsLoading] = useState(true)
@@ -83,6 +78,7 @@ export function GameRoom({
       awareness.setLocalState({
         user: { name: playerName, color: playerColor },
         playerId,
+        type: `human`,
       })
     }
 
