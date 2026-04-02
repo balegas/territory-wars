@@ -32,18 +32,19 @@ export function GameRoom({
 }: GameRoomProps) {
   const { registryDB } = useRegistryContext()
 
-  const [{ playerId, playerColor, doc, awareness }] = useState(() => {
+  const [{ playerId, doc, awareness }] = useState(() => {
     const id = `player-${Math.random().toString(36).slice(2, 10)}`
     const d = new Y.Doc()
     const a = new Awareness(d)
     a.setLocalState({
-      user: { name: playerName, color: HUMAN_PLAYER_COLOR },
+      user: { name: playerName },
       playerId: id,
       type: `human`,
     })
-    return { playerId: id, playerColor: HUMAN_PLAYER_COLOR, doc: d, awareness: a }
+    return { playerId: id, doc: d, awareness: a }
   })
 
+  const playerColor = HUMAN_PLAYER_COLOR
   const [isLoading, setIsLoading] = useState(true)
   const [isSynced, setIsSynced] = useState(false)
   const [error, setError] = useState<Error | null>(null)
@@ -76,7 +77,7 @@ export function GameRoom({
     // Re-set awareness in case React Strict Mode cleared it
     if (awareness.getLocalState() === null) {
       awareness.setLocalState({
-        user: { name: playerName, color: playerColor },
+        user: { name: playerName },
         playerId,
         type: `human`,
       })
@@ -89,16 +90,7 @@ export function GameRoom({
       provider.destroy()
       providerRef.current = null
     }
-  }, [
-    roomId,
-    doc,
-    awareness,
-    yjsBaseUrl,
-    yjsHeaders,
-    playerName,
-    playerColor,
-    playerId,
-  ])
+  }, [roomId, doc, awareness, yjsBaseUrl, yjsHeaders, playerName, playerId])
 
   // Renew room TTL periodically so active rooms don't expire.
   // Only the elected writer (lowest playerId) performs the renewal.

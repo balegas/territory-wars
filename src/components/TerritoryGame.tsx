@@ -1,25 +1,25 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { useGameRoom } from "./game-room-context"
 import {
-  parseRoomConfig,
-  getCellsMap,
-  getPlayersMap,
-  readPlayers,
-  readCells,
-  countCellsForPlayer,
-  findEnclosedCells,
-  initGameTimer,
-  getGameStartedAt,
-  getGameEndedAt,
-  setGameEnded,
-  findWinner,
-  findLeaderByScore,
-  getPlayerScores,
-  WIN_THRESHOLD,
-  MOVE_INTERVAL,
-  STUN_DURATION,
   GAME_DURATION_MS,
+  MOVE_INTERVAL,
+  PLAYER_COLORS,
+  WIN_THRESHOLD,
+  countCellsForPlayer,
+  executeMove,
+  findLeaderByScore,
+  findWinner,
+  getCellsMap,
+  getGameEndedAt,
+  getGameStartedAt,
+  getPlayerScores,
+  getPlayersMap,
+  initGameTimer,
+  parseRoomConfig,
+  readCells,
+  readPlayers,
+  setGameEnded,
 } from "../utils/game-logic"
+import { useGameRoom } from "./game-room-context"
 import type { TerritoryCell, TerritoryPlayer } from "../utils/game-logic"
 
 // ============================================================================
@@ -57,7 +57,8 @@ const DIR_MAP: Record<string, { dx: number; dy: number }> = {
 }
 
 function computeCellSize(cols: number, rows: number): number {
-  if (cols > 100 || rows > 100) return 2
+  if (cols > 256 || rows > 256) return 2
+  if (cols > 64 || rows > 64) return 4
   return 14
 }
 
@@ -143,7 +144,6 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
       x: startX,
       y: startY,
       name: playerName,
-      color: playerColor,
     })
 
     const cellsMap = getCellsMap(doc)
@@ -192,8 +192,10 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
       const remaining = Math.max(0, GAME_DURATION_MS - elapsed)
       setTimeRemaining(Math.ceil(remaining / 1000))
 
-      if (remaining <= 0 && getGameEndedAt(doc) === null) {
-        // Time's up — find leader
+      const alreadyEnded = getGameEndedAt(doc) !== null
+
+      if (remaining <= 0 && !alreadyEnded) {
+        // Time's up — find leader and end the game
         const currentCells = readCells(doc)
         const result = findLeaderByScore(
           currentCells,
@@ -206,6 +208,24 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
           setWinner({ name: `Nobody`, pct: 0 })
         }
         setGameEnded(doc)
+      } else if (alreadyEnded) {
+        // Game already ended (refresh, or ended by bot/other player)
+        setWinner((prev) => {
+          if (prev) return prev
+          const currentCells = readCells(doc)
+          const thresholdWinner = findWinner(
+            currentCells,
+            totalCells,
+            getPlayersMap(doc)
+          )
+          if (thresholdWinner) return thresholdWinner
+          const topPlayer = findLeaderByScore(
+            currentCells,
+            totalCells,
+            getPlayersMap(doc)
+          )
+          return topPlayer ?? { name: `Nobody`, pct: 0 }
+        })
       }
     }
     const interval = setInterval(tick, 1000)
@@ -393,80 +413,26 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
       if (getGameEndedAt(doc) !== null) return
 
       const ref = localRef.current
-      const now = Date.now()
-
-      if (ref.stunnedUntil && now < ref.stunnedUntil) return
-
-      const nx = Math.max(0, Math.min(cols - 1, ref.x + dir.dx))
-      const ny = Math.max(0, Math.min(rows - 1, ref.y + dir.dy))
-      if (nx === ref.x && ny === ref.y) return
-
-      const others = readPlayers(doc, playerId)
-      const collidedWith = Array.from(others.entries()).find(
-        ([, p]) => p.x === nx && p.y === ny
-      )
-
-      if (collidedWith) {
-        const [otherId, otherPlayer] = collidedWith
-        const stunUntil = now + STUN_DURATION
-        ref.stunnedUntil = stunUntil
-
-        const playersMap = getPlayersMap(doc)
-        playersMap.set(otherId, { ...otherPlayer, stunnedUntil: stunUntil })
-        playersMap.set(playerId, {
-          x: ref.x,
-          y: ref.y,
-          name: playerName,
-          color: playerColor,
-          stunnedUntil: stunUntil,
-        })
-        return
-      }
-
-      ref.x = nx
-      ref.y = ny
-      setLocalPos({ x: nx, y: ny })
-
-      awareness.setLocalState({
-        ...awareness.getLocalState(),
-        x: nx,
-        y: ny,
-      })
-
-      const playersMap = getPlayersMap(doc)
-      playersMap.set(playerId, {
-        x: nx,
-        y: ny,
-        name: playerName,
-        color: playerColor,
-      })
-
-      const cellsMap = getCellsMap(doc)
-      const claimTime = Date.now()
-      doc.transact(() => {
-        cellsMap.set(`${nx},${ny}`, {
-          owner: playerId,
-          claimedAt: claimTime,
-        })
-      })
-
-      const activePlayers = new Set<string>([playerId])
-      readPlayers(doc, playerId).forEach((_, id) => activePlayers.add(id))
-      const enclosed = findEnclosedCells(
+      const result = executeMove(
+        doc,
         playerId,
-        cellsMap,
+        playerName,
+        { x: ref.x, y: ref.y },
+        dir,
         cols,
         rows,
-        activePlayers
+        ref.stunnedUntil
       )
-      if (enclosed.length > 0) {
-        doc.transact(() => {
-          for (const cell of enclosed) {
-            cellsMap.set(`${cell.x},${cell.y}`, {
-              owner: playerId,
-              claimedAt: claimTime,
-            })
-          }
+
+      ref.stunnedUntil = result.stunnedUntil
+      if (result.moved) {
+        ref.x = result.x
+        ref.y = result.y
+        setLocalPos({ x: result.x, y: result.y })
+        awareness.setLocalState({
+          ...awareness.getLocalState(),
+          x: result.x,
+          y: result.y,
         })
       }
     }
@@ -527,12 +493,15 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
     )
   }, [cols, rows, W, H, CELL, showGridLines])
 
+  // Build color map locally — me = always purple, others = sequential from PLAYER_COLORS
   const ownerColors = useMemo(() => {
     const colors = new Map<string, string>()
     colors.set(playerId, playerColor)
-    otherPlayers.forEach((p, id) => {
-      colors.set(id, p.color)
-    })
+    // Sort other players by ID for stable ordering, assign colors in sequence
+    const otherIds = [...otherPlayers.keys()].sort()
+    for (let i = 0; i < otherIds.length; i++) {
+      colors.set(otherIds[i], PLAYER_COLORS[i % PLAYER_COLORS.length])
+    }
     return colors
   }, [playerId, playerColor, otherPlayers])
 
@@ -644,13 +613,13 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
               }}
             >
               {[
-                { id: playerId, name: playerName, color: playerColor },
+                { id: playerId, name: playerName },
                 ...Array.from(otherPlayers.entries()).map(([id, p]) => ({
                   id,
                   name: p.name,
-                  color: p.color,
                 })),
               ].map((p) => {
+                const color = ownerColors.get(p.id) ?? PLAYER_COLORS[0]
                 const pCells = playerScores.get(p.id) || 0
                 const pPct = Math.round((pCells / totalCells) * 100)
                 return (
@@ -671,7 +640,7 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
                           width: 6,
                           height: 6,
                           borderRadius: `50%`,
-                          background: p.color,
+                          background: color,
                           display: `inline-block`,
                         }}
                       />
@@ -710,8 +679,7 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
             style={{
               marginBottom: leader ? 4 : 0,
               color:
-                leader &&
-                leader.pct >= Math.round(WIN_THRESHOLD * 100) - 5
+                leader && leader.pct >= Math.round(WIN_THRESHOLD * 100) - 5
                   ? `#FF3D71`
                   : PALETTE.dim,
             }}
@@ -739,15 +707,13 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
         onTouchEnd={onTouchEnd}
         onClick={onBoardClick}
         style={{
-          width: `100%`,
+          width: `min(100%, calc(100dvh - 140px))`,
           maxWidth: W,
           height: `auto`,
+          aspectRatio: `${cols} / ${rows}`,
           background: PALETTE.grid,
           border: `1px solid ${PALETTE.border}`,
-          flex: `1 1 auto`,
-          minHeight: 0,
-          maxHeight: `calc(100dvh - 120px)`,
-          objectFit: `contain`,
+          flexShrink: 0,
           userSelect: `none`,
           WebkitUserSelect: `none`,
         }}
@@ -775,6 +741,7 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
         {Array.from(otherPlayers.entries()).map(([id, p]) => {
           const isStunned =
             p.stunnedUntil != null && Date.now() < p.stunnedUntil
+          const pColor = ownerColors.get(id) ?? PLAYER_COLORS[0]
           return (
             <g key={id} className={isStunned ? `stunned` : undefined}>
               <rect
@@ -782,9 +749,9 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
                 y={p.y * CELL}
                 width={CELL}
                 height={CELL}
-                fill={p.color}
+                fill={pColor}
                 opacity={0.7}
-                stroke={p.color}
+                stroke={pColor}
                 strokeWidth={2}
               />
               <text
@@ -792,7 +759,7 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
                 y={p.y * CELL - 4}
                 textAnchor="middle"
                 fontSize={6}
-                fill={p.color}
+                fill={pColor}
                 fontFamily="'Press Start 2P', monospace"
               >
                 {p.name}
@@ -846,9 +813,7 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
               textAlign: `center`,
             }}
           >
-            {winner.name === playerName
-              ? `YOU WIN!`
-              : `${winner.name} WINS!`}
+            {winner.name === playerName ? `YOU WIN!` : `${winner.name} WINS!`}
           </div>
           <div
             style={{
@@ -858,7 +823,7 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
               textAlign: `center`,
             }}
           >
-            {winner.pct}% TERRITORY CLAIMED
+            {winner.pct}% OF {Math.round(WIN_THRESHOLD * 100)}% TO WIN
           </div>
           <div style={{ display: `flex`, gap: 8 }}>
             <button

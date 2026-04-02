@@ -13,7 +13,6 @@ export interface TerritoryPlayer {
   x: number
   y: number
   name: string
-  color: string
   stunnedUntil?: number
 }
 
@@ -153,15 +152,12 @@ export function findEnclosedCells(
   cellsMap: Y.Map<TerritoryCell>,
   cols: number,
   rows: number,
-  activePlayers: Set<string>
+  _activePlayers: Set<string>
 ): Array<{ x: number; y: number }> {
   const ownerCells = new Set<string>()
-  const activeOtherCells = new Set<string>()
   cellsMap.forEach((cell, key) => {
     if (cell.owner === ownerId) {
       ownerCells.add(key)
-    } else if (activePlayers.has(cell.owner)) {
-      activeOtherCells.add(key)
     }
   })
 
@@ -209,7 +205,7 @@ export function findEnclosedCells(
   for (let y = 0; y < rows; y++) {
     for (let x = 0; x < cols; x++) {
       const k = `${x},${y}`
-      if (!reachable.has(k) && !ownerCells.has(k) && !activeOtherCells.has(k)) {
+      if (!reachable.has(k) && !ownerCells.has(k)) {
         enclosed.push({ x, y })
       }
     }
@@ -244,7 +240,6 @@ export function executeMove(
   doc: Y.Doc,
   playerId: string,
   playerName: string,
-  playerColor: string,
   currentPos: { x: number; y: number },
   dir: { dx: number; dy: number },
   cols: number,
@@ -290,7 +285,6 @@ export function executeMove(
       x: currentPos.x,
       y: currentPos.y,
       name: playerName,
-      color: playerColor,
       stunnedUntil: stunUntil,
     })
     return {
@@ -308,7 +302,6 @@ export function executeMove(
     x: nx,
     y: ny,
     name: playerName,
-    color: playerColor,
   })
 
   // Claim cell
@@ -362,23 +355,6 @@ export function getColor(index: number): string {
  * Pick the first color from PLAYER_COLORS not already used by existing players.
  * Falls back to hashName-based color if all colors are taken.
  */
-export function pickUniqueColor(playerName: string, doc: Y.Doc): string {
-  const playersMap = getPlayersMap(doc)
-  const usedColors = new Set<string>()
-  playersMap.forEach((p) => {
-    usedColors.add(p.color)
-  })
-
-  for (const color of PLAYER_COLORS) {
-    if (!usedColors.has(color)) {
-      return color
-    }
-  }
-
-  // All colors taken — fall back to hash
-  return getColor(hashName(playerName))
-}
-
 // ============================================================================
 // Game state helpers
 // ============================================================================

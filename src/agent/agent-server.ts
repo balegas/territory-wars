@@ -3,9 +3,16 @@ import { REGISTRY_TTL_SECONDS } from "../utils/schemas"
 import { BOT_NAMES, PLAYER_COLORS } from "../utils/game-logic"
 import { AIPlayer } from "./ai-player"
 import { HaikuClient } from "./haiku-client"
+import type { AgentPersonality } from "./haiku-client"
 import type { RoomMetadata } from "../utils/schemas"
 
 const NUM_BOTS = 4
+const BOT_PERSONALITIES: Array<AgentPersonality> = [
+  `destroyer`,
+  `explorer`,
+  `greedy`,
+  `balanced`,
+]
 
 interface RoomEntry {
   roomId: string
@@ -140,14 +147,12 @@ export class AgentServer {
       const isNew = !this.rooms.has(roomId)
       this.rooms.set(roomId, metadata)
 
-      if (this.initialized && !this.startupRoomIds.has(roomId)) {
+      if (isNew && this.initialized && !this.startupRoomIds.has(roomId)) {
         const now = Date.now()
-        if (metadata.expiresAt > now && !this.activeRooms.has(roomId)) {
-          console.log(
-            `[AgentServer] ${isNew ? `New room` : `Player rejoined room`}: ${roomId}`
-          )
+        if (metadata.expiresAt > now) {
+          console.log(`[AgentServer] New room detected: ${roomId}`)
           this.spawnBotsForRoom(roomId)
-        } else if (isNew && metadata.expiresAt <= now) {
+        } else if (metadata.expiresAt <= now) {
           console.log(`[AgentServer] New room already expired: ${roomId}`)
         }
       }
@@ -178,18 +183,11 @@ export class AgentServer {
 
     console.log(`[AgentServer] Spawning ${NUM_BOTS} bot(s) for: ${roomId}`)
 
-    // Only the first bot monitors for humans leaving — one callback is enough
-    const onNoHumans = () => {
-      console.log(
-        `[AgentServer] All humans left room ${roomId} — destroying bots`
-      )
-      this.destroyBotsForRoom(roomId)
-    }
-
     const players: Array<AIPlayer> = []
     for (let i = 0; i < NUM_BOTS; i++) {
       const name = BOT_NAMES[i]
       const color = PLAYER_COLORS[PLAYER_COLORS.length - 1 - i]
+      const personality = BOT_PERSONALITIES[i % BOT_PERSONALITIES.length]
       const player = new AIPlayer(
         name,
         roomId,
@@ -197,7 +195,8 @@ export class AgentServer {
         this.yjsHeaders,
         this.haikuClient,
         color,
-        i === 0 ? onNoHumans : undefined
+        personality,
+        i
       )
       players.push(player)
     }
