@@ -3,44 +3,13 @@ import * as Y from "yjs"
 import { Awareness } from "y-protocols/awareness"
 import { YjsProvider } from "@durable-streams/y-durable-streams"
 import { ROOM_TTL_RENEWAL_MS, ROOM_TTL_SECONDS } from "../utils/schemas"
+import { HUMAN_PLAYER_COLOR } from "../utils/game-logic"
 import { GameRoomContext } from "./game-room-context"
 import { ScoresProvider } from "./scores-context"
 import { useRegistryContext } from "./registry-context"
 import { TerritoryGame } from "./TerritoryGame"
 import type { YjsProviderStatus } from "@durable-streams/y-durable-streams"
 import type { GameRoomContextValue } from "./game-room-context"
-
-// ============================================================================
-// Player colors
-// ============================================================================
-
-// Avoid #FF6B35 (obstacle solid) and #FFD93D (obstacle warning)
-const PLAYER_COLORS = [
-  `#00E5FF`,
-  `#FF3D71`,
-  `#6eeb83`,
-  `#ffbc42`,
-  `#ee6352`,
-  `#9ac2c9`,
-  `#8acb88`,
-  `#1be7ff`,
-  `#C77DFF`,
-  `#72EFDD`,
-  `#F72585`,
-  `#4ECDC4`,
-]
-
-function getColor(index: number): string {
-  return PLAYER_COLORS[index % PLAYER_COLORS.length]
-}
-
-function hashName(name: string): number {
-  let hash = 0
-  for (let i = 0; i < name.length; i++) {
-    hash = (hash * 31 + name.charCodeAt(i)) | 0
-  }
-  return Math.abs(hash)
-}
 
 // ============================================================================
 // GameRoom component
@@ -63,22 +32,19 @@ export function GameRoom({
 }: GameRoomProps) {
   const { registryDB } = useRegistryContext()
 
-  const [{ playerId, playerColor }] = useState(() => {
+  const [{ playerId, doc, awareness }] = useState(() => {
     const id = `player-${Math.random().toString(36).slice(2, 10)}`
-    const colorIdx = hashName(playerName)
-    return { playerId: id, playerColor: getColor(colorIdx) }
-  })
-
-  const [{ doc, awareness }] = useState(() => {
     const d = new Y.Doc()
     const a = new Awareness(d)
     a.setLocalState({
-      user: { name: playerName, color: playerColor },
-      playerId,
+      user: { name: playerName },
+      playerId: id,
+      type: `human`,
     })
-    return { doc: d, awareness: a }
+    return { playerId: id, doc: d, awareness: a }
   })
 
+  const playerColor = HUMAN_PLAYER_COLOR
   const [isLoading, setIsLoading] = useState(true)
   const [isSynced, setIsSynced] = useState(false)
   const [error, setError] = useState<Error | null>(null)
@@ -111,8 +77,9 @@ export function GameRoom({
     // Re-set awareness in case React Strict Mode cleared it
     if (awareness.getLocalState() === null) {
       awareness.setLocalState({
-        user: { name: playerName, color: playerColor },
+        user: { name: playerName },
         playerId,
+        type: `human`,
       })
     }
 
@@ -123,16 +90,7 @@ export function GameRoom({
       provider.destroy()
       providerRef.current = null
     }
-  }, [
-    roomId,
-    doc,
-    awareness,
-    yjsBaseUrl,
-    yjsHeaders,
-    playerName,
-    playerColor,
-    playerId,
-  ])
+  }, [roomId, doc, awareness, yjsBaseUrl, yjsHeaders, playerName, playerId])
 
   // Renew room TTL periodically so active rooms don't expire.
   // Only the elected writer (lowest playerId) performs the renewal.

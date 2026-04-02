@@ -1,17 +1,31 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import {
+  GAME_DURATION_MS,
+  MOVE_INTERVAL,
+  PLAYER_COLORS,
+  WIN_THRESHOLD,
+  countCellsForPlayer,
+  executeMove,
+  findLeaderByScore,
+  findWinner,
+  getCellsMap,
+  getGameEndedAt,
+  getGameStartedAt,
+  getPlayerScores,
+  getPlayersMap,
+  initGameTimer,
+  parseRoomConfig,
+  readCells,
+  readPlayers,
+  setGameEnded,
+} from "../utils/game-logic"
 import { useGameRoom } from "./game-room-context"
-import type * as Y from "yjs"
+import type { TerritoryCell, TerritoryPlayer } from "../utils/game-logic"
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-const CELL = 14
-const DEFAULT_COLS = 30
-const DEFAULT_ROWS = 25
-const MOVE_INTERVAL = 120
-const STUN_DURATION = 1500
-const WIN_THRESHOLD = 0.5
 const POINTS_PER_CELL = 1
 
 const FONT_SM = 8
@@ -28,36 +42,8 @@ const PALETTE = {
 }
 
 // ============================================================================
-// Types
-// ============================================================================
-
-interface TerritoryCell {
-  owner: string
-  claimedAt: number
-}
-
-interface TerritoryPlayer {
-  x: number
-  y: number
-  name: string
-  color: string
-  stunnedUntil?: number
-}
-
-// ============================================================================
 // Helpers
 // ============================================================================
-
-function parseRoomConfig(roomId: string): { cols: number; rows: number } {
-  const match = roomId.match(/__(\d+)x(\d+)(?:_(\d+)ms)?$/)
-  if (match) {
-    return {
-      cols: parseInt(match[1]),
-      rows: parseInt(match[2]),
-    }
-  }
-  return { cols: DEFAULT_COLS, rows: DEFAULT_ROWS }
-}
 
 const DIR_MAP: Record<string, { dx: number; dy: number }> = {
   ArrowUp: { dx: 0, dy: -1 },
@@ -70,125 +56,10 @@ const DIR_MAP: Record<string, { dx: number; dy: number }> = {
   d: { dx: 1, dy: 0 },
 }
 
-// ============================================================================
-// Yjs helpers
-// ============================================================================
-
-function getCellsMap(doc: Y.Doc): Y.Map<TerritoryCell> {
-  return doc.getMap(`territoryCell`)
-}
-
-function getPlayersMap(doc: Y.Doc): Y.Map<TerritoryPlayer> {
-  return doc.getMap(`players`)
-}
-
-function readPlayers(doc: Y.Doc, myId: string): Map<string, TerritoryPlayer> {
-  const playersMap = getPlayersMap(doc)
-  const result = new Map<string, TerritoryPlayer>()
-  playersMap.forEach((val, key) => {
-    if (key !== myId) {
-      result.set(key, val)
-    }
-  })
-  return result
-}
-
-function readCells(doc: Y.Doc): Map<string, TerritoryCell> {
-  const cellsMap = getCellsMap(doc)
-  const result = new Map<string, TerritoryCell>()
-  cellsMap.forEach((val, key) => {
-    result.set(key, val)
-  })
-  return result
-}
-
-function countCellsForPlayer(
-  cells: Map<string, TerritoryCell>,
-  playerId: string
-): number {
-  let count = 0
-  cells.forEach((cell) => {
-    if (cell.owner === playerId) count++
-  })
-  return count
-}
-
-// ============================================================================
-// Territory fill: flood-fill to find enclosed empty regions
-// ============================================================================
-
-function findEnclosedCells(
-  ownerId: string,
-  cellsMap: Y.Map<TerritoryCell>,
-  cols: number,
-  rows: number,
-  activePlayers: Set<string>
-): Array<{ x: number; y: number }> {
-  // Build sets for quick lookup
-  const ownerCells = new Set<string>()
-  const activeOtherCells = new Set<string>()
-  cellsMap.forEach((cell, key) => {
-    if (cell.owner === ownerId) {
-      ownerCells.add(key)
-    } else if (activePlayers.has(cell.owner)) {
-      // Only treat cells from active players as blocking
-      activeOtherCells.add(key)
-    }
-    // Cells from departed players are treated as empty (claimable)
-  })
-
-  // Flood-fill from all edge cells, treating owner's cells as walls
-  const reachable = new Set<string>()
-  const queue: Array<{ x: number; y: number }> = []
-
-  for (let x = 0; x < cols; x++) {
-    for (const y of [0, rows - 1]) {
-      const k = `${x},${y}`
-      if (!ownerCells.has(k) && !reachable.has(k)) {
-        reachable.add(k)
-        queue.push({ x, y })
-      }
-    }
-  }
-  for (let y = 0; y < rows; y++) {
-    for (const x of [0, cols - 1]) {
-      const k = `${x},${y}`
-      if (!ownerCells.has(k) && !reachable.has(k)) {
-        reachable.add(k)
-        queue.push({ x, y })
-      }
-    }
-  }
-
-  while (queue.length > 0) {
-    const { x, y } = queue.pop()!
-    for (const [dx, dy] of [
-      [0, -1],
-      [0, 1],
-      [-1, 0],
-      [1, 0],
-    ]) {
-      const nx = x + dx
-      const ny = y + dy
-      if (nx < 0 || nx >= cols || ny < 0 || ny >= rows) continue
-      const nk = `${nx},${ny}`
-      if (ownerCells.has(nk) || reachable.has(nk)) continue
-      reachable.add(nk)
-      queue.push({ x: nx, y: ny })
-    }
-  }
-
-  // Enclosed = not reachable, not ours, and no active other player's cell
-  const enclosed: Array<{ x: number; y: number }> = []
-  for (let y = 0; y < rows; y++) {
-    for (let x = 0; x < cols; x++) {
-      const k = `${x},${y}`
-      if (!reachable.has(k) && !ownerCells.has(k) && !activeOtherCells.has(k)) {
-        enclosed.push({ x, y })
-      }
-    }
-  }
-  return enclosed
+function computeCellSize(cols: number, rows: number): number {
+  if (cols > 256 || rows > 256) return 2
+  if (cols > 64 || rows > 64) return 4
+  return 14
 }
 
 // ============================================================================
@@ -204,6 +75,8 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
     useGameRoom()
   const { cols, rows } = useMemo(() => parseRoomConfig(roomId), [roomId])
   const totalCells = cols * rows
+  const CELL = useMemo(() => computeCellSize(cols, rows), [cols, rows])
+  const showGridLines = cols <= 100 && rows <= 100
 
   const [cells, setCells] = useState<Map<string, TerritoryCell>>(new Map())
   const [otherPlayers, setOtherPlayers] = useState<
@@ -216,7 +89,10 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
   const [connectedCount, setConnectedCount] = useState(1)
   const [copied, setCopied] = useState(false)
   const [showPlayers, setShowPlayers] = useState(false)
-  const [winner, setWinner] = useState<string | null>(null)
+  const [winner, setWinner] = useState<{ name: string; pct: number } | null>(
+    null
+  )
+  const [timeRemaining, setTimeRemaining] = useState(GAME_DURATION_MS / 1000)
   const displayRoomName = roomId.replace(/__\d+x\d+(?:_\d+ms)?$/, ``)
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined)
 
@@ -238,16 +114,8 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
     [myScore, totalCells]
   )
 
-  // Compute all player scores for the tooltip and high score display
-  const playerScores = useMemo(() => {
-    const scores = new Map<string, number>()
-    cells.forEach((cell) => {
-      scores.set(cell.owner, (scores.get(cell.owner) || 0) + 1)
-    })
-    return scores
-  }, [cells])
+  const playerScores = useMemo(() => getPlayerScores(cells), [cells])
 
-  // Find the leading player
   const leader = useMemo(() => {
     let maxCells = 0
     let leaderId = ``
@@ -259,13 +127,12 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
     })
     if (!leaderId || maxCells === 0) return null
     const leaderPct = Math.round((maxCells / totalCells) * 100)
-    // Find name
     if (leaderId === playerId) return { name: playerName, pct: leaderPct }
     const other = otherPlayers.get(leaderId)
     return other ? { name: other.name, pct: leaderPct } : null
   }, [playerScores, totalCells, playerId, playerName, otherPlayers])
 
-  // Initialize player position
+  // Initialize player position and game timer
   useEffect(() => {
     const startX = Math.floor(Math.random() * cols)
     const startY = Math.floor(Math.random() * rows)
@@ -277,10 +144,8 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
       x: startX,
       y: startY,
       name: playerName,
-      color: playerColor,
     })
 
-    // Claim the starting cell
     const cellsMap = getCellsMap(doc)
     doc.transact(() => {
       cellsMap.set(`${startX},${startY}`, {
@@ -289,41 +154,84 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
       })
     })
 
+    // Start the game timer if not already started
+    initGameTimer(doc)
+
     return () => {
       playersMap.delete(playerId)
     }
   }, [doc, playerId, playerName, playerColor, cols, rows])
 
-  // Observe cells
+  // Observe cells + check win condition
   useEffect(() => {
     const cellsMap = getCellsMap(doc)
     const handler = () => {
       const newCells = readCells(doc)
       setCells(newCells)
 
-      // Check win condition
-      const scores = new Map<string, number>()
-      newCells.forEach((cell) => {
-        scores.set(cell.owner, (scores.get(cell.owner) || 0) + 1)
-      })
-      const threshold = WIN_THRESHOLD * totalCells
-      scores.forEach((count, ownerId) => {
-        if (count >= threshold) {
-          // Find owner name
-          const playersMap = getPlayersMap(doc)
-          const ownerData = playersMap.get(ownerId)
-          if (ownerData) {
-            setWinner(ownerData.name)
-          } else if (ownerId === playerId) {
-            setWinner(playerName)
-          }
-        }
-      })
+      if (getGameEndedAt(doc) !== null) return
+
+      const result = findWinner(newCells, totalCells, getPlayersMap(doc))
+      if (result) {
+        setWinner(result)
+        setGameEnded(doc)
+      }
     }
     cellsMap.observe(handler)
     handler()
     return () => cellsMap.unobserve(handler)
-  }, [doc, totalCells, playerId, playerName])
+  }, [doc, totalCells])
+
+  // Game timer countdown
+  useEffect(() => {
+    const tick = () => {
+      const startedAt = getGameStartedAt(doc)
+      if (!startedAt) return
+
+      const elapsed = Date.now() - startedAt
+      const remaining = Math.max(0, GAME_DURATION_MS - elapsed)
+      setTimeRemaining(Math.ceil(remaining / 1000))
+
+      const alreadyEnded = getGameEndedAt(doc) !== null
+
+      if (remaining <= 0 && !alreadyEnded) {
+        // Time's up — find leader and end the game
+        const currentCells = readCells(doc)
+        const result = findLeaderByScore(
+          currentCells,
+          totalCells,
+          getPlayersMap(doc)
+        )
+        if (result) {
+          setWinner(result)
+        } else {
+          setWinner({ name: `Nobody`, pct: 0 })
+        }
+        setGameEnded(doc)
+      } else if (alreadyEnded) {
+        // Game already ended (refresh, or ended by bot/other player)
+        setWinner((prev) => {
+          if (prev) return prev
+          const currentCells = readCells(doc)
+          const thresholdWinner = findWinner(
+            currentCells,
+            totalCells,
+            getPlayersMap(doc)
+          )
+          if (thresholdWinner) return thresholdWinner
+          const topPlayer = findLeaderByScore(
+            currentCells,
+            totalCells,
+            getPlayersMap(doc)
+          )
+          return topPlayer ?? { name: `Nobody`, pct: 0 }
+        })
+      }
+    }
+    const interval = setInterval(tick, 1000)
+    tick()
+    return () => clearInterval(interval)
+  }, [doc, totalCells])
 
   // Observe other players
   useEffect(() => {
@@ -376,16 +284,13 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
         const wasEmpty = !dirRef.current
         pressed.add(e.key)
         dirRef.current = DIR_MAP[e.key]
-        // Immediate move on first keypress (don't wait for interval)
         if (wasEmpty) moveRef.current?.(DIR_MAP[e.key])
       }
     }
 
     const handleKeyUp = (e: KeyboardEvent) => {
       pressed.delete(e.key)
-      // If no direction keys are pressed, stop moving
       if (e.key in DIR_MAP) {
-        // Check if any other direction key is still pressed
         let stillPressed = false
         for (const key of pressed) {
           if (key in DIR_MAP) {
@@ -408,36 +313,39 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
     }
   }, [])
 
-  // Touch controls — rate-limited to MOVE_INTERVAL like keyboard
+  // Touch controls
   const svgRef = useRef<SVGSVGElement>(null)
   const touchStartRef = useRef<{ x: number; y: number } | null>(null)
   const lastTouchMoveRef = useRef(0)
   const SWIPE_THRESHOLD = 10
 
-  const touchMove = useCallback((clientX: number, clientY: number) => {
-    const now = Date.now()
-    if (now - lastTouchMoveRef.current < MOVE_INTERVAL) return
-    const svg = svgRef.current
-    if (!svg) return
-    const pt = svg.createSVGPoint()
-    pt.x = clientX
-    pt.y = clientY
-    const ctm = svg.getScreenCTM()
-    if (!ctm) return
-    const svgPt = pt.matrixTransform(ctm.inverse())
-    const cx = svgPt.x / CELL - 0.5
-    const cy = svgPt.y / CELL - 0.5
-    const ref = localRef.current
-    const dx = cx - ref.x
-    const dy = cy - ref.y
-    if (dx === 0 && dy === 0) return
-    if (Math.abs(dx) > Math.abs(dy)) {
-      moveRef.current?.({ dx: dx > 0 ? 1 : -1, dy: 0 })
-    } else {
-      moveRef.current?.({ dx: 0, dy: dy > 0 ? 1 : -1 })
-    }
-    lastTouchMoveRef.current = now
-  }, [])
+  const touchMove = useCallback(
+    (clientX: number, clientY: number) => {
+      const now = Date.now()
+      if (now - lastTouchMoveRef.current < MOVE_INTERVAL) return
+      const svg = svgRef.current
+      if (!svg) return
+      const pt = svg.createSVGPoint()
+      pt.x = clientX
+      pt.y = clientY
+      const ctm = svg.getScreenCTM()
+      if (!ctm) return
+      const svgPt = pt.matrixTransform(ctm.inverse())
+      const cx = svgPt.x / CELL - 0.5
+      const cy = svgPt.y / CELL - 0.5
+      const ref = localRef.current
+      const dx = cx - ref.x
+      const dy = cy - ref.y
+      if (dx === 0 && dy === 0) return
+      if (Math.abs(dx) > Math.abs(dy)) {
+        moveRef.current?.({ dx: dx > 0 ? 1 : -1, dy: 0 })
+      } else {
+        moveRef.current?.({ dx: 0, dy: dy > 0 ? 1 : -1 })
+      }
+      lastTouchMoveRef.current = now
+    },
+    [CELL]
+  )
 
   const onTouchStart = useCallback(
     (e: React.TouchEvent) => {
@@ -468,132 +376,76 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
     touchStartRef.current = null
   }, [])
 
-  // Mouse click — click an adjacent cell to move there (one step)
   const moveRef = useRef<(dir: { dx: number; dy: number }) => void>(undefined)
 
-  const onBoardClick = useCallback((e: React.MouseEvent<SVGSVGElement>) => {
-    const svg = svgRef.current
-    if (!svg) return
-    const pt = svg.createSVGPoint()
-    pt.x = e.clientX
-    pt.y = e.clientY
-    const ctm = svg.getScreenCTM()
-    if (!ctm) return
-    const svgPt = pt.matrixTransform(ctm.inverse())
-    const cx = svgPt.x / CELL - 0.5
-    const cy = svgPt.y / CELL - 0.5
-    const ref = localRef.current
-    const dx = cx - ref.x
-    const dy = cy - ref.y
-    if (dx === 0 && dy === 0) return
-    // Move one step in the cardinal direction closest to the click
-    if (Math.abs(dx) > Math.abs(dy)) {
-      moveRef.current?.({ dx: dx > 0 ? 1 : -1, dy: 0 })
-    } else {
-      moveRef.current?.({ dx: 0, dy: dy > 0 ? 1 : -1 })
-    }
-  }, [])
+  const onBoardClick = useCallback(
+    (e: React.MouseEvent<SVGSVGElement>) => {
+      const svg = svgRef.current
+      if (!svg) return
+      const pt = svg.createSVGPoint()
+      pt.x = e.clientX
+      pt.y = e.clientY
+      const ctm = svg.getScreenCTM()
+      if (!ctm) return
+      const svgPt = pt.matrixTransform(ctm.inverse())
+      const cx = svgPt.x / CELL - 0.5
+      const cy = svgPt.y / CELL - 0.5
+      const ref = localRef.current
+      const dx = cx - ref.x
+      const dy = cy - ref.y
+      if (dx === 0 && dy === 0) return
+      if (Math.abs(dx) > Math.abs(dy)) {
+        moveRef.current?.({ dx: dx > 0 ? 1 : -1, dy: 0 })
+      } else {
+        moveRef.current?.({ dx: 0, dy: dy > 0 ? 1 : -1 })
+      }
+    },
+    [CELL]
+  )
 
   const handleLeave = useCallback(() => {
     onLeave()
   }, [onLeave])
 
-  // Movement logic — shared by keyboard interval and mouse click
+  // Movement logic
   useEffect(() => {
     const doMove = (dir: { dx: number; dy: number }) => {
+      if (getGameEndedAt(doc) !== null) return
+
       const ref = localRef.current
-      const now = Date.now()
-
-      if (ref.stunnedUntil && now < ref.stunnedUntil) return
-
-      const nx = Math.max(0, Math.min(cols - 1, ref.x + dir.dx))
-      const ny = Math.max(0, Math.min(rows - 1, ref.y + dir.dy))
-      if (nx === ref.x && ny === ref.y) return
-
-      const others = readPlayers(doc, playerId)
-      const collidedWith = Array.from(others.entries()).find(
-        ([, p]) => p.x === nx && p.y === ny
-      )
-
-      if (collidedWith) {
-        const [otherId, otherPlayer] = collidedWith
-        const stunUntil = now + STUN_DURATION
-        ref.stunnedUntil = stunUntil
-
-        const playersMap = getPlayersMap(doc)
-        playersMap.set(otherId, { ...otherPlayer, stunnedUntil: stunUntil })
-        playersMap.set(playerId, {
-          x: ref.x,
-          y: ref.y,
-          name: playerName,
-          color: playerColor,
-          stunnedUntil: stunUntil,
-        })
-        return
-      }
-
-      ref.x = nx
-      ref.y = ny
-      setLocalPos({ x: nx, y: ny })
-
-      // Update awareness on move to keep presence fresh
-      awareness.setLocalState({
-        ...awareness.getLocalState(),
-        x: nx,
-        y: ny,
-      })
-
-      const playersMap = getPlayersMap(doc)
-      playersMap.set(playerId, {
-        x: nx,
-        y: ny,
-        name: playerName,
-        color: playerColor,
-      })
-
-      const cellsMap = getCellsMap(doc)
-      const claimTime = Date.now()
-      doc.transact(() => {
-        cellsMap.set(`${nx},${ny}`, {
-          owner: playerId,
-          claimedAt: claimTime,
-        })
-      })
-
-      // Check for enclosed regions and fill them
-      // Departed players' cells are treated as empty (claimable)
-      const activePlayers = new Set<string>([playerId])
-      readPlayers(doc, playerId).forEach((_, id) => activePlayers.add(id))
-      const enclosed = findEnclosedCells(
+      const result = executeMove(
+        doc,
         playerId,
-        cellsMap,
+        playerName,
+        { x: ref.x, y: ref.y },
+        dir,
         cols,
         rows,
-        activePlayers
+        ref.stunnedUntil
       )
-      if (enclosed.length > 0) {
-        doc.transact(() => {
-          for (const cell of enclosed) {
-            cellsMap.set(`${cell.x},${cell.y}`, {
-              owner: playerId,
-              claimedAt: claimTime,
-            })
-          }
+
+      ref.stunnedUntil = result.stunnedUntil
+      if (result.moved) {
+        ref.x = result.x
+        ref.y = result.y
+        setLocalPos({ x: result.x, y: result.y })
+        awareness.setLocalState({
+          ...awareness.getLocalState(),
+          x: result.x,
+          y: result.y,
         })
       }
     }
 
-    // Expose for click handler
     moveRef.current = doMove
 
-    // Keyboard repeat interval
     const intervalId = setInterval(() => {
       const dir = dirRef.current
       if (dir) doMove(dir)
     }, MOVE_INTERVAL)
 
     return () => clearInterval(intervalId)
-  }, [doc, playerId, playerName, playerColor, cols, rows])
+  }, [doc, playerId, playerName, playerColor, cols, rows, awareness])
 
   // ============================================================================
   // Render
@@ -611,8 +463,9 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
 
   useEffect(() => () => clearTimeout(copiedTimerRef.current), [])
 
-  const gridLines = useMemo(
-    () => (
+  const gridLines = useMemo(() => {
+    if (!showGridLines) return null
+    return (
       <>
         {Array.from({ length: cols }, (_, i) => (
           <line
@@ -637,19 +490,26 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
           />
         ))}
       </>
-    ),
-    [cols, rows, W, H]
-  )
+    )
+  }, [cols, rows, W, H, CELL, showGridLines])
 
-  // Build a color lookup for owners
+  // Build color map locally — me = always purple, others = sequential from PLAYER_COLORS
   const ownerColors = useMemo(() => {
     const colors = new Map<string, string>()
     colors.set(playerId, playerColor)
-    otherPlayers.forEach((p, id) => {
-      colors.set(id, p.color)
-    })
+    // Sort other players by ID for stable ordering, assign colors in sequence
+    const otherIds = [...otherPlayers.keys()].sort()
+    for (let i = 0; i < otherIds.length; i++) {
+      colors.set(otherIds[i], PLAYER_COLORS[i % PLAYER_COLORS.length])
+    }
     return colors
   }, [playerId, playerColor, otherPlayers])
+
+  const formatTime = (seconds: number) => {
+    const m = Math.floor(seconds / 60)
+    const s = seconds % 60
+    return `${m}:${s.toString().padStart(2, `0`)}`
+  }
 
   return (
     <div
@@ -676,7 +536,7 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
         .stunned { animation: stun-pulse 0.3s ease-in-out infinite; }
       `}</style>
 
-      {/* Header: EXIT | name@room | PLAYERS */}
+      {/* Header: EXIT | name@room | TIMER | PLAYERS */}
       <div
         style={{
           display: `flex`,
@@ -719,6 +579,14 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
             {copied ? `COPIED` : displayRoomName}
           </span>
         </div>
+        <span
+          style={{
+            color: timeRemaining <= 30 ? `#FF3D71` : PALETTE.accent,
+            fontVariantNumeric: `tabular-nums`,
+          }}
+        >
+          {formatTime(timeRemaining)}
+        </span>
         <div
           style={{
             color: PALETTE.accent,
@@ -745,13 +613,13 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
               }}
             >
               {[
-                { id: playerId, name: playerName, color: playerColor },
+                { id: playerId, name: playerName },
                 ...Array.from(otherPlayers.entries()).map(([id, p]) => ({
                   id,
                   name: p.name,
-                  color: p.color,
                 })),
               ].map((p) => {
+                const color = ownerColors.get(p.id) ?? PLAYER_COLORS[0]
                 const pCells = playerScores.get(p.id) || 0
                 const pPct = Math.round((pCells / totalCells) * 100)
                 return (
@@ -772,7 +640,7 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
                           width: 6,
                           height: 6,
                           borderRadius: `50%`,
-                          background: p.color,
+                          background: color,
                           display: `inline-block`,
                         }}
                       />
@@ -839,15 +707,13 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
         onTouchEnd={onTouchEnd}
         onClick={onBoardClick}
         style={{
-          width: `100%`,
+          width: `min(100%, calc(100dvh - 140px))`,
           maxWidth: W,
           height: `auto`,
+          aspectRatio: `${cols} / ${rows}`,
           background: PALETTE.grid,
           border: `1px solid ${PALETTE.border}`,
-          flex: `1 1 auto`,
-          minHeight: 0,
-          maxHeight: `calc(100dvh - 120px)`,
-          objectFit: `contain`,
+          flexShrink: 0,
           userSelect: `none`,
           WebkitUserSelect: `none`,
         }}
@@ -875,6 +741,7 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
         {Array.from(otherPlayers.entries()).map(([id, p]) => {
           const isStunned =
             p.stunnedUntil != null && Date.now() < p.stunnedUntil
+          const pColor = ownerColors.get(id) ?? PLAYER_COLORS[0]
           return (
             <g key={id} className={isStunned ? `stunned` : undefined}>
               <rect
@@ -882,9 +749,9 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
                 y={p.y * CELL}
                 width={CELL}
                 height={CELL}
-                fill={p.color}
+                fill={pColor}
                 opacity={0.7}
-                stroke={p.color}
+                stroke={pColor}
                 strokeWidth={2}
               />
               <text
@@ -892,7 +759,7 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
                 y={p.y * CELL - 4}
                 textAnchor="middle"
                 fontSize={6}
-                fill={p.color}
+                fill={pColor}
                 fontFamily="'Press Start 2P', monospace"
               >
                 {p.name}
@@ -946,7 +813,7 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
               textAlign: `center`,
             }}
           >
-            {winner === playerName ? `YOU WIN!` : `${winner} WINS!`}
+            {winner.name === playerName ? `YOU WIN!` : `${winner.name} WINS!`}
           </div>
           <div
             style={{
@@ -956,17 +823,21 @@ export function TerritoryGame({ onLeave }: TerritoryGameProps) {
               textAlign: `center`,
             }}
           >
-            {WIN_THRESHOLD * 100}% TERRITORY CLAIMED
+            {winner.pct}% OF {Math.round(WIN_THRESHOLD * 100)}% TO WIN
           </div>
           <div style={{ display: `flex`, gap: 8 }}>
             <button
               onClick={() => {
                 const cellsMap = getCellsMap(doc)
+                const gameState = doc.getMap(`gameState`)
                 doc.transact(() => {
                   const keys = Array.from(cellsMap.keys())
                   keys.forEach((k) => cellsMap.delete(k))
+                  gameState.delete(`gameStartedAt`)
+                  gameState.delete(`gameEndedAt`)
                 })
                 setWinner(null)
+                initGameTimer(doc)
               }}
               style={{
                 fontFamily: `inherit`,
